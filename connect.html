@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#c2410c">
+<title>Jackson · Connect</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="logo">J</div>
+  <div><h1>Connect</h1><small>Instagram &amp; Facebook</small></div>
+  <a class="hlink" href="/">← Posts</a>
+</header>
+<main>
+  <section class="card">
+    <h2>Status</h2>
+    <div class="conn" id="status"><span class="dot"></span><span class="muted">Checking…</span></div>
+    <div id="urlWarn"></div>
+    <button class="wide hidden" id="disconnectBtn">Disconnect</button>
+  </section>
+
+  <section class="card">
+    <h2>Paste your Meta access key</h2>
+    <p class="muted" style="margin-top:0">Create it once in Meta (the README's step 3 shows exactly where), then paste it here.
+      Jackson finds your Facebook Page and the Instagram account linked to it.</p>
+    <textarea id="token" placeholder="EAAG…" style="min-height:110px;font-family:ui-monospace,Menlo,monospace;font-size:13px"></textarea>
+    <div class="pages hidden" id="pages"><label class="lbl">You manage several Pages. Which one is Renovate Builders?</label></div>
+    <button class="primary wide" id="connectBtn">Connect</button>
+    <div id="msg"></div>
+  </section>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+async function api(url, opts={}){ const r = await fetch(url, opts); let d; try { d = await r.json(); } catch { d = {}; }
+  if (!r.ok) throw new Error(d.detail || `Something went wrong (${r.status})`); return d; }
+const post = (url, body) => api(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
+function show(id, text, kind){ $(id).innerHTML = ""; if (!text) return; const el = document.createElement("div"); el.className = "msg " + kind; el.textContent = text; $(id).append(el); }
+
+function render(s){
+  const box = $("#status"); box.innerHTML = "";
+  const dot = document.createElement("span"); dot.className = "dot " + (s.connected ? "on" : "off");
+  const t = document.createElement("span");
+  if (!s.connected) t.textContent = "Not connected yet.";
+  else { t.textContent = `Facebook Page: ${s.page_name} · Instagram: ${s.instagram ? "@" + s.instagram : "⚠ no Instagram Business account linked to this Page"}` +
+         ` · Access: ${s.expires_in_days === null ? "never expires ✔" : "expires in " + s.expires_in_days + " days"}`; }
+  box.append(dot, t);
+  $("#disconnectBtn").classList.toggle("hidden", !s.connected);
+  if (s.public_url === "") show("#urlWarn", "PUBLIC_URL isn't set on the server, so Meta can't download your photos. Add it in Render → Environment.", "err");
+}
+async function load(){ try { render(await api("/api/meta/status")); } catch (e) { show("#msg", e.message, "err"); } }
+
+$("#connectBtn").onclick = async () => {
+  const token = $("#token").value.trim(); if (!token) return show("#msg", "Paste the access key first.", "err");
+  const chosen = document.querySelector("input[name=page]:checked");
+  const btn = $("#connectBtn"); btn.disabled = true; btn.textContent = "Connecting…"; show("#msg");
+  try {
+    const r = await post("/api/meta/connect", {token, page_id: chosen ? chosen.value : null});
+    if (r.choose_page) {
+      const box = $("#pages"); box.classList.remove("hidden"); box.querySelectorAll("label:not(.lbl)").forEach(x => x.remove());
+      r.choose_page.forEach((p, i) => { const l = document.createElement("label"); const inp = document.createElement("input");
+        inp.type = "radio"; inp.name = "page"; inp.value = p.id; inp.checked = i === 0;
+        l.append(inp, `${p.name}${p.instagram ? " · @" + p.instagram : ""}`); box.append(l); });
+      btn.textContent = "Connect this Page"; btn.disabled = false; return;
+    }
+    render(r); $("#token").value = ""; $("#pages").classList.add("hidden");
+    show("#msg", r.instagram ? "Connected ✔ You can start posting." : "Facebook connected ✔, but no Instagram Business account is linked to this Page. See the README, step 1.", r.instagram ? "ok" : "err");
+  } catch (e) { show("#msg", e.message, "err"); }
+  btn.disabled = false; if (btn.textContent === "Connecting…") btn.textContent = "Connect";
+};
+$("#disconnectBtn").onclick = async () => { render(await post("/api/meta/disconnect")); };
+load();
+</script>
+</body>
+</html>

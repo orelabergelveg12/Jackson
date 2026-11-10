@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#c2410c">
+<title>Jackson · Posts</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="logo">J</div>
+  <div><h1>Jackson</h1><small>Renovate Builders · posts</small></div>
+  <a class="hlink" href="/connect">Connect</a>
+</header>
+
+<main>
+  <div class="card conn" id="conn"><span class="dot"></span><span class="muted">Checking connection…</span></div>
+
+  <!-- STEP 1: new post -->
+  <section class="card" id="step1">
+    <h2>New post</h2>
+    <label class="drop" for="files">
+      <b>📷 Add job photos</b>
+      <span>Up to 10 · before &amp; after works great</span>
+    </label>
+    <input id="files" type="file" accept="image/*" multiple class="hidden">
+    <div class="thumbs" id="thumbs"></div>
+
+    <label class="lbl" for="notes">Notes for Jackson</label>
+    <textarea id="notes" dir="auto" placeholder="e.g. Bathroom in Ramat Gan, 3 weeks. Removed the old bath, walk-in shower, full waterproofing, large grey tiles, floating vanity."></textarea>
+
+    <label class="lbl">Language</label>
+    <div class="seg" id="lang">
+      <button data-v="en" class="on">English</button><button data-v="he">עברית</button><button data-v="both">Both</button>
+    </div>
+
+    <button class="primary wide" id="writeBtn" disabled>Write the posts</button>
+    <div id="msg1"></div>
+  </section>
+
+  <!-- STEP 2: review -->
+  <section class="card hidden" id="step2">
+    <h2>Review &amp; approve</h2>
+    <div id="statusMsg"></div>
+    <div class="thumbs" id="thumbs2"></div>
+    <div id="ownerNote"></div>
+
+    <div class="post">
+      <div class="post-head"><input type="checkbox" id="on_instagram" checked><b>Instagram</b><span class="count" id="c_instagram"></span></div>
+      <textarea id="t_instagram" dir="auto"></textarea>
+    </div>
+    <div class="post">
+      <div class="post-head"><input type="checkbox" id="on_facebook" checked><b>Facebook</b><span class="count" id="c_facebook"></span></div>
+      <textarea id="t_facebook" dir="auto"></textarea>
+    </div>
+
+    <div id="editArea">
+      <label class="lbl" for="feedback">Want changes? Tell Jackson</label>
+      <div class="row">
+        <input type="text" id="feedback" dir="auto" placeholder="e.g. shorter, mention the hidden storage" style="flex:1;min-width:0">
+        <button id="regenBtn">Rewrite</button>
+      </div>
+
+      <label class="lbl">When</label>
+      <div class="seg" id="when">
+        <button data-v="now" class="on">Publish now</button><button data-v="later">Schedule</button>
+      </div>
+      <input type="datetime-local" id="scheduleAt" class="hidden" style="margin-top:10px">
+
+      <button class="primary wide" id="publishBtn">Approve &amp; publish</button>
+    </div>
+    <button class="wide hidden" id="unschedBtn">Cancel schedule</button>
+    <button class="wide" id="newBtn" style="margin-top:8px">New post</button>
+    <div id="msg2"></div>
+  </section>
+
+  <section class="card">
+    <h2>Recent posts</h2>
+    <div id="history"><span class="muted">Nothing yet.</span></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+let files = [], draft = null, lang = "en", when = "now";
+const LIMITS = {instagram: 2200, facebook: 5000};
+const NAMES = {instagram: "Instagram", facebook: "Facebook", setup: "Setup"};
+
+function seg(el, cb){ el.addEventListener("click", e => {
+  const b = e.target.closest("button"); if(!b) return;
+  el.querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }); }
+seg($("#lang"), v => lang = v);
+seg($("#when"), v => { when = v; $("#scheduleAt").classList.toggle("hidden", v !== "later");
+  if (v === "later" && !$("#scheduleAt").value) { const d = new Date(Date.now() + 864e5); d.setHours(18,0,0,0);
+    $("#scheduleAt").value = new Date(d - d.getTimezoneOffset()*6e4).toISOString().slice(0,16); }
+  $("#publishBtn").textContent = v === "later" ? "Approve & schedule" : "Approve & publish"; });
+
+function msg(id, parts, kind){ const box = $(id); box.innerHTML = ""; if (!parts) return;
+  const el = document.createElement("div"); el.className = "msg " + kind;
+  (Array.isArray(parts) ? parts : [parts]).forEach((p, i) => { if (i) el.append(document.createElement("br"));
+    if (typeof p === "string") el.append(p); else { const a = document.createElement("a"); a.href = p.href; a.target = "_blank"; a.textContent = p.text; el.append(a); } });
+  box.append(el); }
+function busy(btn, on, label){ btn.disabled = on; if (on){ btn.dataset.label = btn.textContent; btn.innerHTML = `<span class="spinner"></span>${label}`; } else if (btn.dataset.label) btn.textContent = btn.dataset.label; }
+async function api(url, opts={}){ const r = await fetch(url, opts); let d; try { d = await r.json(); } catch { d = {}; }
+  if (!r.ok) throw new Error(d.detail || `Something went wrong (${r.status})`); return d; }
+const post = (url, body) => api(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
+
+async function loadConn(){
+  const box = $("#conn");
+  try { const s = await api("/api/meta/status"); box.innerHTML = "";
+    const dot = document.createElement("span"); dot.className = "dot " + (s.connected ? "on" : "off");
+    const t = document.createElement("span");
+    if (!s.connected) { t.innerHTML = 'Not connected to Instagram/Facebook yet. <a href="/connect">Connect now →</a>'; }
+    else { t.textContent = `Facebook: ${s.page_name} · Instagram: ${s.instagram ? "@" + s.instagram : "not linked"}`;
+      if (s.expires_in_days !== null && s.expires_in_days < 10) { t.append(` · access expires in ${s.expires_in_days} days, `);
+        const a = document.createElement("a"); a.href = "/connect"; a.textContent = "reconnect"; t.append(a); } }
+    box.append(dot, t);
+  } catch (e) { box.textContent = e.message; }
+}
+
+$("#files").addEventListener("change", e => {
+  files = [...files, ...e.target.files].slice(0, 10); e.target.value = "";
+  $("#thumbs").innerHTML = ""; files.forEach(f => { const i = new Image(); i.src = URL.createObjectURL(f); $("#thumbs").append(i); });
+  $("#writeBtn").disabled = !files.length;
+});
+
+function count(k){ const t = $("#t_"+k); t.style.height = "auto"; t.style.height = (t.scrollHeight + 4) + "px";
+  const n = t.value.length, el = $("#c_"+k); el.textContent = `${n} / ${LIMITS[k]}`; el.classList.toggle("over", n > LIMITS[k]); }
+["instagram","facebook"].forEach(k => $("#t_"+k).addEventListener("input", () => count(k)));
+
+function fillDraft(d){
+  draft = d;
+  $("#thumbs2").innerHTML = "";
+  for (let n = 1; n <= d.photo_count; n++){ const i = new Image(); i.src = `/photos/${d.id}/${n}`; $("#thumbs2").append(i); }
+  for (const k of ["instagram","facebook"]) { $("#t_"+k).value = d.posts[k] || ""; $("#on_"+k).checked = (d.platforms || []).includes(k); }
+  $("#ownerNote").innerHTML = "";
+  if (d.posts.note_for_owner) { const n = document.createElement("div"); n.className = "note"; n.textContent = "💡 " + d.posts.note_for_owner; $("#ownerNote").append(n); }
+  $("#step1").classList.add("hidden"); $("#step2").classList.remove("hidden"); msg("#msg2");
+  const locked = ["published","scheduled","publishing"].includes(d.status);
+  $("#editArea").classList.toggle("hidden", locked);
+  $("#unschedBtn").classList.toggle("hidden", d.status !== "scheduled");
+  document.querySelectorAll("#step2 textarea, #step2 .post-head input").forEach(x => x.disabled = locked);
+  const results = d.results || {}, errors = d.errors || {};
+  if (d.status === "published") {
+    msg("#statusMsg", ["✔ Published", ...Object.entries(results).map(([p, url]) => url.startsWith("http") ? {href: url, text: `View on ${NAMES[p]} →`} : `${NAMES[p]}: done`)], "ok");
+  } else if (d.status === "scheduled") {
+    msg("#statusMsg", `✔ Scheduled for ${d.schedule_at.replace("T"," ")}. Jackson will publish it then.`, "ok");
+  } else if (d.status === "publishing") {
+    msg("#statusMsg", "Publishing…", "ok");
+  } else if (d.status === "error") {
+    const lines = Object.entries(errors).map(([p, e]) => `${NAMES[p] || p}: ${e}`);
+    Object.entries(results).forEach(([p, url]) => lines.push(url.startsWith("http") ? {href: url, text: `${NAMES[p]} published ✔`} : `${NAMES[p]}: published ✔`));
+    msg("#statusMsg", ["Some posts didn't go out:", ...lines, "Fix the problem and tap the button again. Jackson only retries what failed."], "err");
+    $("#publishBtn").textContent = "Try again";
+  } else { msg("#statusMsg"); $("#publishBtn").textContent = when === "later" ? "Approve & schedule" : "Approve & publish"; }
+  requestAnimationFrame(() => ["instagram","facebook"].forEach(count));
+  window.scrollTo({top: 0, behavior: "smooth"});
+}
+
+$("#writeBtn").onclick = async () => {
+  const btn = $("#writeBtn"); busy(btn, true, "Jackson is looking at the photos…"); msg("#msg1");
+  const fd = new FormData(); files.forEach(f => fd.append("photos", f)); fd.append("notes", $("#notes").value); fd.append("language", lang);
+  try { fillDraft(await api("/api/drafts", {method: "POST", body: fd})); loadHistory(); }
+  catch (e) { msg("#msg1", e.message, "err"); } finally { busy(btn, false); }
+};
+
+$("#regenBtn").onclick = async () => {
+  const btn = $("#regenBtn"); busy(btn, true, "Rewriting…"); msg("#msg2");
+  try { fillDraft(await post(`/api/drafts/${draft.id}/regenerate`, {feedback: $("#feedback").value})); $("#feedback").value = ""; }
+  catch (e) { msg("#msg2", e.message, "err"); } finally { busy(btn, false); }
+};
+
+$("#publishBtn").onclick = async () => {
+  const platforms = ["instagram","facebook"].filter(p => $("#on_"+p).checked);
+  if (!platforms.length) return msg("#msg2", "Tick at least one platform.", "err");
+  if (when === "later" && !$("#scheduleAt").value) return msg("#msg2", "Pick a date and time.", "err");
+  const btn = $("#publishBtn"); busy(btn, true, when === "later" ? "Scheduling…" : "Publishing… (up to a minute)"); msg("#msg2");
+  try {
+    const d = await post(`/api/drafts/${draft.id}/publish`, {platforms, instagram: $("#t_instagram").value,
+      facebook: $("#t_facebook").value, schedule_at: when === "later" ? $("#scheduleAt").value : null});
+    busy(btn, false); fillDraft(d); loadHistory();
+  } catch (e) { busy(btn, false); msg("#msg2", e.message, "err"); }
+};
+
+$("#unschedBtn").onclick = async () => { try { fillDraft(await post(`/api/drafts/${draft.id}/unschedule`)); loadHistory(); } catch (e) { msg("#msg2", e.message, "err"); } };
+
+$("#newBtn").onclick = () => { files = []; draft = null; $("#thumbs").innerHTML = ""; $("#notes").value = "";
+  $("#writeBtn").disabled = true; msg("#msg1"); $("#step2").classList.add("hidden"); $("#step1").classList.remove("hidden"); };
+
+async function loadHistory(){
+  try {
+    const items = await api("/api/history"); const box = $("#history");
+    if (!items.length) return; box.innerHTML = "";
+    for (const it of items){
+      const row = document.createElement("div"); row.className = "hist";
+      row.innerHTML = `<img alt=""><div style="min-width:0"><span class="badge"></span> <span class="muted"></span><p dir="auto"></p></div>`;
+      row.querySelector("img").src = `/photos/${it.id}/1`;
+      const b = row.querySelector(".badge"); b.textContent = it.status; b.classList.add(it.status);
+      row.querySelector(".muted").textContent = (it.status === "scheduled" ? it.schedule_at : it.published_at || it.created || "").replace("T", " ").slice(0, 16);
+      row.querySelector("p").textContent = it.notes || it.preview;
+      row.onclick = async () => fillDraft(await api(`/api/drafts/${it.id}`));
+      box.append(row);
+    }
+  } catch {}
+}
+loadConn(); loadHistory();
+</script>
+</body>
+</html>
