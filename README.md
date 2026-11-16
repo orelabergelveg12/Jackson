@@ -156,7 +156,8 @@ Open Jackson → **Autopilot** (top right).
    - **Post automatically:** Jackson schedules and publishes on his own. You can still open,
      edit or cancel any scheduled post before it goes out.
 4. **What to post:** tick the types you want (Educational, Seasonal, FAQ, Trend, Showcase).
-5. **Your area:** your city or region, so seasonal tips and trends fit your market.
+5. **Areas you serve:** one city or neighborhood per line. Jackson rotates through them, focusing each
+   post on the area used least recently. Project showcases use the project's own location.
 6. **Slide color:** your brand color for the carousel slides.
 7. **Save settings.**
 

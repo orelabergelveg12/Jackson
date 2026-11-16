@@ -104,11 +104,12 @@ DEFAULT_SETTINGS = {
     "platforms": ["instagram", "facebook"],
     "content_types": ["educational", "seasonal", "faq", "trend", "showcase"],
     "use_web_search": True,
-    "location": "",                    # city/region for seasonal & trend context
+    "areas": [],                       # cities/neighborhoods served; Jackson rotates through them
     "timezone": os.environ.get("TIMEZONE", "Asia/Jerusalem"),
     "brand_color": "#c2410c",
     "notify_email": "",
     "prepared_slots": [],
+    "area_history": [],
     "last_run": None,
     "last_error": None,
 }
@@ -126,7 +127,40 @@ def load_settings() -> dict:
     if "time" in raw and "times" not in raw:     # saved by the older one-time-a-day version
         s["times"] = [raw["time"]]
     s.pop("time", None)
+    if "areas" not in raw and raw.get("location"):  # older single-area setting
+        s["areas"] = split_areas(raw["location"])
+    s.pop("location", None)
     return s
+
+
+def split_areas(text) -> list[str]:
+    items = text if isinstance(text, list) else str(text).replace(";", ",").replace("\n", ",").split(",")
+    out = []
+    for a in items:
+        a = str(a).strip()
+        if a and a.lower() not in [x.lower() for x in out]:
+            out.append(a[:60])
+    return out[:30]
+
+
+def pick_area(settings: dict) -> str | None:
+    """Rotate through the service areas: the one used least in recent posts goes next."""
+    areas = settings.get("areas") or []
+    if not areas:
+        return None
+    used = list(reversed(settings.get("area_history") or []))[:60]    # most recent first
+    def score(a):
+        last = next((i for i, u in enumerate(used) if u == a), 999)   # how many posts ago it was used
+        return (used.count(a), -last, areas.index(a))
+    return sorted(areas, key=score)[0]
+
+
+def remember_area(area: str | None):
+    if not area:
+        return
+    s = load_settings()
+    s["area_history"] = ((s.get("area_history") or []) + [area])[-60:]
+    save_settings(s)
 
 
 def save_settings(s: dict):
@@ -345,7 +379,7 @@ PLAN_TOOL = {
 }
 
 
-def plan_with_claude(settings: dict) -> dict:
+def plan_with_claude(settings: dict, area: str | None = None) -> dict:
     allowed = [t for t in settings["content_types"] if t in CONTENT_TYPES] or ["educational"]
     lib = [it for it in library_items()][:40]
     if not lib and "showcase" in allowed:
@@ -356,9 +390,17 @@ def plan_with_claude(settings: dict) -> dict:
     lib_txt = "\n".join(f"- id={it['id']} used={it.get('used', 0)}x last_used={it.get('last_used') or 'never'}: "
                         f"{it.get('notes') or '(no notes)'}" for it in lib) or "(empty)"
     n = now()
+    areas = settings.get("areas") or []
+    if area:
+        others = ", ".join(a for a in areas if a != area)
+        area_txt = (f"Focus area for THIS post: {area}. Mention it naturally (e.g. 'homeowners in {area}') and use "
+                    f"1–2 local hashtags for it. Don't mention other cities in this post. "
+                    f"(Other areas we serve, used in other posts: {others or 'none'}.)")
+    else:
+        area_txt = "Service area: see the brand guide."
     request = f"""Plan ONE new post for Renovate Builders' Instagram and Facebook.
 
-Today: {n.strftime('%A %d %B %Y')}  ·  Location / market: {settings.get('location') or 'see brand guide'}
+Today: {n.strftime('%A %d %B %Y')}\n{area_txt}
 Allowed content types (pick the one that best fits right now, and vary it against recent posts):
 {chr(10).join(f'- {t}: {CONTENT_TYPES[t]}' for t in allowed)}
 
@@ -373,6 +415,7 @@ Rules:
 - For carousels: a cover title that hooks, 3–6 slides with one clear point each, then a closing call to action.
 - For 'trend': {'use web search (1–3 searches) to find a current renovation or interior trend, and mention the source in note_for_owner.' if settings.get('use_web_search') else 'web search is off; pick a well-established trend instead.'}
 - For 'showcase': choose a library_item_id and write captions about that project using its notes only.
+  Use the project's own location from its notes (ignore the focus area); if the notes give none, name no city.
 - Finish by calling plan_post exactly once."""
 
     tools = [PLAN_TOOL]
@@ -407,7 +450,8 @@ def handle_for_slides() -> str:
 
 def build_auto_draft(settings: dict, slot: datetime | None) -> dict:
     """Plan + build one autopilot draft. Returns the saved draft."""
-    plan = plan_with_claude(settings)
+    area = pick_area(settings)
+    plan = plan_with_claude(settings, area)
     ctype = plan.get("content_type", "educational")
     lib_ids = {it["id"]: it for it in library_items()}
     item = lib_ids.get(plan.get("library_item_id") or "")
@@ -436,7 +480,11 @@ def build_auto_draft(settings: dict, slot: datetime | None) -> dict:
     notes = f"Autopilot · {ctype}: {plan['topic']}"
     if item and ctype == "showcase":
         notes += f"\nProject notes: {item.get('notes', '')}"
+    if area and ctype != "showcase":
+        notes += f" · {area}"
+        remember_area(area)
     d = new_draft(photos, notes, origin="autopilot", content_type=ctype, topic=plan["topic"],
+                  area=area if ctype != "showcase" else None,
                   platforms=[p for p in settings["platforms"] if p in PLATFORMS] or list(PLATFORMS))
     d["posts"] = {"instagram": plan["instagram"][:INSTAGRAM_MAX_CHARS], "facebook": plan["facebook"],
                   "alt_text": plan.get("alt_text", ""), "note_for_owner": plan.get("note_for_owner", "")}
@@ -900,7 +948,7 @@ class SettingsIn(BaseModel):
     platforms: list[str]
     content_types: list[str]
     use_web_search: bool
-    location: str = ""
+    areas: list[str] = []
     timezone: str
     brand_color: str = "#c2410c"
     notify_email: str = ""
@@ -908,7 +956,7 @@ class SettingsIn(BaseModel):
 
 def autopilot_status() -> dict:
     s = load_settings()
-    return {**{k: v for k, v in s.items() if k != "prepared_slots"},
+    return {**{k: v for k, v in s.items() if k not in ("prepared_slots", "area_history")},
             "next_slots": [describe_slot(x.strftime("%Y-%m-%dT%H:%M")) for x in upcoming_slots(s)][:6]
             if s["enabled"] else [],
             "email_ready": bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD),
@@ -936,7 +984,7 @@ def set_autopilot(body: SettingsIn):
              mode="auto" if body.mode == "auto" else "approve",
              platforms=[p for p in body.platforms if p in PLATFORMS] or list(PLATFORMS),
              content_types=[c for c in body.content_types if c in CONTENT_TYPES] or ["educational"],
-             use_web_search=body.use_web_search, location=body.location.strip()[:120],
+             use_web_search=body.use_web_search, areas=split_areas(body.areas),
              timezone=body.timezone, brand_color=body.brand_color if body.brand_color.startswith("#") else "#c2410c",
              notify_email=body.notify_email.strip()[:200])
     save_settings(s)

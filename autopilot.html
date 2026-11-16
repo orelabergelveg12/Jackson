@@ -52,8 +52,9 @@
     <h2>What to post</h2>
     <div id="types"></div>
     <label class="checkline" style="margin-top:8px;border-top:2px solid var(--line)"><input type="checkbox" id="use_web_search"> <span><b>Search the web for current trends</b><br><span class="muted">About 1–3¢ per search, only for trend posts.</span></span></label>
-    <label class="lbl" for="location">Your area (for seasons, weather and local trends)</label>
-    <input type="text" id="location" placeholder="e.g. your city and region">
+    <label class="lbl" for="areas">Areas you serve (one per line)</label>
+    <textarea id="areas" style="min-height:120px" placeholder="Seattle&#10;Bellevue&#10;Redmond&#10;Kirkland"></textarea>
+    <p class="muted" style="margin-top:6px">Jackson rotates through these: each post focuses on one area, picking the one used least recently. Project showcases use the project's own location.</p>
     <label class="lbl" for="brand_color">Slide color</label>
     <input type="color" id="brand_color" value="#c2410c" style="width:80px;height:44px;padding:4px">
   </section>
@@ -137,7 +138,7 @@ function render(s){
     m.textContent = label + (k === "showcase" && !s.library_count ? " (add projects to the library below first)" : ""); t.append(m);
     l.append(i, t); $("#types").append(l); });
   $("#use_web_search").checked = s.use_web_search;
-  $("#location").value = s.location || "";
+  $("#areas").value = (s.areas || []).join("\n");
   $("#brand_color").value = s.brand_color || "#c2410c";
   $("#notify_email").value = s.notify_email || "";
   $("#emailHelp").textContent = s.email_ready ? "Email sending is set up ✔"
@@ -147,7 +148,7 @@ function render(s){
 async function save(extra = {}){
   const body = {enabled: $("#enabled").checked, days: checked("#days").map(Number), times: [...document.querySelectorAll("#times input")].map(i => i.value).filter(Boolean), mode,
     platforms: checked("#platforms"), content_types: checked("#types"), use_web_search: $("#use_web_search").checked,
-    location: $("#location").value, timezone: $("#timezone").value, brand_color: $("#brand_color").value,
+    areas: $("#areas").value.split(/[\n,]/).map(x => x.trim()).filter(Boolean), timezone: $("#timezone").value, brand_color: $("#brand_color").value,
     notify_email: $("#notify_email").value, ...extra};
   return render(await post("/api/autopilot", body));
 }
