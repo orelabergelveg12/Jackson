@@ -344,6 +344,37 @@ WRITE_TOOL = {
 }
 
 
+def ask_for_tool(tools: list, tool_name: str, messages: list, max_tokens: int = 3000, rounds: int = 5) -> dict:
+    """Ask Claude to answer by calling `tool_name` (without forcing it: Opus 5.5 doesn't allow forced
+    tool_choice). If Claude replies in plain text or leaves out required fields, ask again."""
+    tool = next(t for t in tools if t.get("name") == tool_name)
+    required = tool["input_schema"].get("required", [])
+    messages = list(messages)
+    for _ in range(rounds):
+        try:
+            resp = client.messages.create(model=MODEL, max_tokens=max_tokens, system=SYSTEM_WRITER,
+                                          tools=tools, messages=messages)
+        except anthropic.BadRequestError as e:
+            if len(tools) > 1 and "web" in str(e).lower() and "search" in str(e).lower():
+                tools = [tool]                       # web search isn't enabled for this account: go without it
+                continue
+            raise
+        call = next((b for b in resp.content if b.type == "tool_use" and b.name == tool_name), None)
+        if call is not None:
+            missing = [k for k in required if not call.input.get(k)]
+            if not missing:
+                return dict(call.input)
+            messages += [{"role": "assistant", "content": resp.content},
+                         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call.id, "is_error": True,
+                          "content": f"Missing fields: {', '.join(missing)}. Call {tool_name} again with every field."}]}]
+            continue
+        messages.append({"role": "assistant", "content": resp.content})
+        if resp.stop_reason == "pause_turn":          # long web search: let Claude continue
+            continue
+        messages.append({"role": "user", "content": f"Now call {tool_name} with the finished result."})
+    raise RuntimeError(f"Claude didn't return the {tool_name} result. Please try again.")
+
+
 def write_posts(d: dict, feedback: str | None = None) -> dict:
     content = []
     for i, p in enumerate(sorted(draft_dir(d["id"]).glob("photo_*.jpg")), 1):
@@ -356,11 +387,9 @@ def write_posts(d: dict, feedback: str | None = None) -> dict:
     if feedback and d.get("posts"):
         request += (f"\n\nYour previous version:\n{json.dumps(d['posts'], ensure_ascii=False)}"
                     f"\n\nThe owner wants these changes: {feedback}")
+    request += "\n\nAnswer by calling the write_posts tool."
     content.append({"type": "text", "text": request})
-    resp = client.messages.create(model=MODEL, max_tokens=3000, system=SYSTEM_WRITER, tools=[WRITE_TOOL],
-                                  tool_choice={"type": "tool", "name": "write_posts"},
-                                  messages=[{"role": "user", "content": content}])
-    posts = dict(next(b.input for b in resp.content if b.type == "tool_use"))
+    posts = ask_for_tool([WRITE_TOOL], "write_posts", [{"role": "user", "content": content}])
     posts["instagram"] = posts["instagram"][:INSTAGRAM_MAX_CHARS]
     posts.setdefault("note_for_owner", "")
     return posts
@@ -443,26 +472,7 @@ Rules:
     tools = [PLAN_TOOL]
     if settings.get("use_web_search") and "trend" in allowed:
         tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}, PLAN_TOOL]
-    messages = [{"role": "user", "content": request}]
-
-    for attempt in range(6):
-        try:
-            resp = client.messages.create(model=MODEL, max_tokens=4000, system=SYSTEM_WRITER,
-                                          tools=tools, messages=messages,
-                                          **({"tool_choice": {"type": "tool", "name": "plan_post"}} if attempt >= 3 else {}))
-        except anthropic.BadRequestError as e:
-            if len(tools) > 1 and "web search" in str(e).lower():   # web search disabled in the Console
-                tools = [PLAN_TOOL]
-                continue
-            raise
-        plan = next((b.input for b in resp.content if b.type == "tool_use" and b.name == "plan_post"), None)
-        if plan:
-            return dict(plan)
-        messages.append({"role": "assistant", "content": resp.content})
-        if resp.stop_reason == "pause_turn":          # long web search: let Claude continue
-            continue
-        messages.append({"role": "user", "content": "Now call plan_post with the finished plan."})
-    raise RuntimeError("Jackson couldn't finish planning the post.")
+    return ask_for_tool(tools, "plan_post", [{"role": "user", "content": request}], max_tokens=4000, rounds=6)
 
 
 def handle_for_slides() -> str:
