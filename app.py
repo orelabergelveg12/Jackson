@@ -1,7 +1,12 @@
 """
-Jackson — Renovate Builders' posting agent.
-Claude Opus 5.5 writes the posts; Jackson publishes them himself to Instagram and Facebook
-through Meta's official Graph API (no third-party posting service).
+Jackson — Renovate Builders' posting agent (English only).
+
+  • Manual posts: upload job photos + a note → Jackson writes Instagram/Facebook posts → you approve.
+  • Autopilot:   on the days/time you choose, Jackson plans a post himself (educational tips,
+                 seasonal advice, FAQs, trends from the web, or a project from your photo library),
+                 designs carousel slides when needed, and either waits for your approval or posts.
+
+Claude Opus 5.5 writes; Jackson publishes directly through Meta's Graph API.
 
 Run locally:
     pip install -r requirements.txt
@@ -14,14 +19,17 @@ import io
 import json
 import os
 import secrets
+import shutil
+import smtplib
 import threading
 import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, available_timezones
 
 import anthropic
 import httpx
@@ -30,6 +38,8 @@ from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from PIL import Image, ImageOps
 from pydantic import BaseModel
+
+import slides
 
 try:                                   # lets Jackson read iPhone HEIC photos
     from pillow_heif import register_heif_opener
@@ -44,6 +54,8 @@ BASE = Path(__file__).parent
 DATA = Path(os.environ.get("DATA_DIR", BASE / "data"))
 DATA.mkdir(parents=True, exist_ok=True)
 META_FILE = DATA / "meta_connection.json"
+AUTOPILOT_FILE = DATA / "autopilot.json"
+LIBRARY = DATA / "library"
 
 MODEL = "claude-opus-5-5"
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
@@ -53,22 +65,89 @@ PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_UR
 GRAPH = f"https://graph.facebook.com/{os.environ.get('GRAPH_VERSION', 'v26.0')}"
 META_APP_ID = os.environ.get("META_APP_ID")          # optional: turns short test tokens into 60-day ones
 META_APP_SECRET = os.environ.get("META_APP_SECRET")
-TIMEZONE = os.environ.get("TIMEZONE", "Asia/Jerusalem")
-TZ = ZoneInfo(TIMEZONE)
+# Optional e-mail notifications (e.g. Gmail with an App Password)
+SMTP_HOST = os.environ.get("SMTP_HOST")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+
 MAX_PHOTOS = 10
 INSTAGRAM_MAX_CHARS = 2200
+PREPARE_HOURS_AHEAD = 24          # autopilot prepares each post this long before its time slot
+PLATFORMS = ("instagram", "facebook")
+CONTENT_TYPES = {
+    "educational": "Educational tips carousel (e.g. '5 signs your bathroom needs re-waterproofing')",
+    "seasonal": "Seasonal / timely advice carousel tied to the current month, weather or holidays",
+    "faq": "Answer one question customers often ask (cost drivers, timelines, permits, materials) as a carousel",
+    "trend": "A current renovation or interior-design trend, found with web search, explained as a carousel",
+    "showcase": "Showcase a project from the photo library (uses the real job photos)",
+}
 
 BRAND = (BASE / "brand.md").read_text(encoding="utf-8")
-LANGUAGES = {"en": "English", "he": "Hebrew", "both": "Hebrew first, then the same text in English"}
-PLATFORMS = ("instagram", "facebook")
 
 client = anthropic.Anthropic()
 security = HTTPBasic()
 publish_lock = threading.Lock()
+claim_lock = threading.Lock()
+autopilot_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Autopilot settings (stored on the disk, edited on the Autopilot page)
+# ---------------------------------------------------------------------------
+
+DEFAULT_SETTINGS = {
+    "enabled": False,
+    "days": [0, 2, 4],                 # Monday=0 … Sunday=6  → Mon, Wed, Fri
+    "times": ["18:00"],                # one post per time on each chosen day
+    "mode": "approve",                 # "approve" = waits for you, "auto" = posts by itself
+    "platforms": ["instagram", "facebook"],
+    "content_types": ["educational", "seasonal", "faq", "trend", "showcase"],
+    "use_web_search": True,
+    "location": "",                    # city/region for seasonal & trend context
+    "timezone": os.environ.get("TIMEZONE", "Asia/Jerusalem"),
+    "brand_color": "#c2410c",
+    "notify_email": "",
+    "prepared_slots": [],
+    "last_run": None,
+    "last_error": None,
+}
+
+
+def load_settings() -> dict:
+    s = dict(DEFAULT_SETTINGS)
+    raw = {}
+    if AUTOPILOT_FILE.exists():
+        try:
+            raw = json.loads(AUTOPILOT_FILE.read_text(encoding="utf-8"))
+        except ValueError:
+            raw = {}
+    s.update(raw)
+    if "time" in raw and "times" not in raw:     # saved by the older one-time-a-day version
+        s["times"] = [raw["time"]]
+    s.pop("time", None)
+    return s
+
+
+def save_settings(s: dict):
+    tmp = AUTOPILOT_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(s, indent=2), encoding="utf-8")
+    tmp.replace(AUTOPILOT_FILE)
+
+
+def tz() -> ZoneInfo:
+    try:
+        return ZoneInfo(load_settings()["timezone"])
+    except Exception:
+        return ZoneInfo("Asia/Jerusalem")
 
 
 def now() -> datetime:
-    return datetime.now(TZ)
+    return datetime.now(tz())
+
+
+def parse_local(s: str) -> datetime:
+    return datetime.fromisoformat(s).replace(tzinfo=tz())
 
 
 def require_login(creds: HTTPBasicCredentials = Depends(security)):
@@ -80,10 +159,11 @@ def require_login(creds: HTTPBasicCredentials = Depends(security)):
 
 
 # ---------------------------------------------------------------------------
-# Photos: fix rotation, convert to JPEG, crop to Instagram's allowed shape (4:5 … 1.91:1)
+# Photos
 # ---------------------------------------------------------------------------
 
 def prepare_photo(raw: bytes) -> bytes:
+    """Fix rotation, convert to JPEG, crop to Instagram's allowed shape (4:5 … 1.91:1)."""
     img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
     w, h = img.size
     if w / h < 0.8:
@@ -104,14 +184,18 @@ def small_b64(jpeg: bytes) -> str:
     return base64.b64encode(out.getvalue()).decode()
 
 
+def safe_id(x: str) -> str:
+    if not x or not x.isalnum():
+        raise HTTPException(400, "Bad id")
+    return x
+
+
 # ---------------------------------------------------------------------------
 # Drafts on disk
 # ---------------------------------------------------------------------------
 
 def draft_dir(draft_id: str) -> Path:
-    if not draft_id.isalnum():
-        raise HTTPException(400, "Bad draft id")
-    d = DATA / "drafts" / draft_id
+    d = DATA / "drafts" / safe_id(draft_id)
     if not d.exists():
         raise HTTPException(404, "Draft not found")
     return d
@@ -128,13 +212,65 @@ def save_draft(d: dict):
     tmp.replace(path)
 
 
+def new_draft(photos: list[bytes], notes: str, **extra) -> dict:
+    draft_id = uuid.uuid4().hex[:12]
+    d_path = DATA / "drafts" / draft_id
+    d_path.mkdir(parents=True)
+    for i, jpg in enumerate(photos, 1):
+        (d_path / f"photo_{i:02d}.jpg").write_bytes(jpg)
+    return {"id": draft_id, "media_key": secrets.token_urlsafe(16), "created": now().isoformat(timespec="minutes"),
+            "notes": notes.strip()[:3000], "status": "draft", "photo_count": len(photos),
+            "platforms": list(PLATFORMS), "origin": "manual", **extra}
+
+
 def public_photo_urls(d: dict) -> list[str]:
     return [f"{PUBLIC_URL}/media/{d['id']}/{d['media_key']}/{n}.jpg" for n in range(1, d["photo_count"] + 1)]
 
 
+def all_drafts() -> list[dict]:
+    out = []
+    for f in (DATA / "drafts").glob("*/draft.json"):
+        try:
+            out.append(json.loads(f.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
 # ---------------------------------------------------------------------------
-# Claude writes the posts
+# Photo library (job photos the autopilot can reuse)
 # ---------------------------------------------------------------------------
+
+def library_items() -> list[dict]:
+    items = []
+    for f in LIBRARY.glob("*/item.json"):
+        try:
+            items.append(json.loads(f.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            pass
+    return sorted(items, key=lambda x: x["created"], reverse=True)
+
+
+def save_item(it: dict):
+    (LIBRARY / it["id"] / "item.json").write_text(json.dumps(it, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def item_photos(item_id: str) -> list[bytes]:
+    return [p.read_bytes() for p in sorted((LIBRARY / safe_id(item_id)).glob("photo_*.jpg"))]
+
+
+# ---------------------------------------------------------------------------
+# Claude: writing posts from photos (manual posts)
+# ---------------------------------------------------------------------------
+
+SYSTEM_WRITER = f"""You are Jackson, the social media manager for Renovate Builders, a renovation company.
+You write in English only. Your posts win new renovation clients: practical, trustworthy, specific.
+Only state facts that are visible in the photos or given to you. Never invent prices, timelines,
+awards, client names or addresses. Follow the brand guide exactly.
+
+<brand_guide>
+{BRAND}
+</brand_guide>"""
 
 WRITE_TOOL = {
     "name": "write_posts",
@@ -144,7 +280,7 @@ WRITE_TOOL = {
         "properties": {
             "instagram": {"type": "string", "description": f"Caption with hashtags at the end. Max {INSTAGRAM_MAX_CHARS} characters."},
             "facebook": {"type": "string", "description": "Slightly longer, conversational, 0–3 hashtags."},
-            "alt_text": {"type": "string", "description": "One-sentence description of the first photo, for accessibility."},
+            "alt_text": {"type": "string", "description": "One-sentence description of the first image, for accessibility."},
             "note_for_owner": {"type": "string", "description": "Optional short tip for the owner (e.g. a blurry photo, a detail worth adding). Empty if none."},
         },
         "required": ["instagram", "facebook", "alt_text"],
@@ -155,33 +291,253 @@ WRITE_TOOL = {
 def write_posts(d: dict, feedback: str | None = None) -> dict:
     content = []
     for i, p in enumerate(sorted(draft_dir(d["id"]).glob("photo_*.jpg")), 1):
-        content += [{"type": "text", "text": f"Photo {i}:"},
+        content += [{"type": "text", "text": f"Image {i}:"},
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
                                                  "data": small_b64(p.read_bytes())}}]
-    request = (f"Owner's notes about this job:\n{d['notes'] or '(no notes, describe what you see)'}\n\n"
-               f"Write the posts in: {LANGUAGES[d['language']]}.")
+    request = f"Notes about this post:\n{d['notes'] or '(no notes, describe what you see)'}\n\nWrite the posts in English."
+    if d.get("origin") == "autopilot":
+        request += "\nThese images are carousel slides Jackson designed; write captions that match them."
     if feedback and d.get("posts"):
         request += (f"\n\nYour previous version:\n{json.dumps(d['posts'], ensure_ascii=False)}"
                     f"\n\nThe owner wants these changes: {feedback}")
     content.append({"type": "text", "text": request})
-
-    system = f"""You are Jackson, the social media writer for Renovate Builders, a renovation company.
-You turn photos of renovation jobs and the owner's quick notes into posts that win new clients.
-Look carefully at the photos and describe real, visible details. Only state facts that are visible
-in the photos or written in the notes. If the photos show before/after, say so.
-Follow the brand guide exactly.
-
-<brand_guide>
-{BRAND}
-</brand_guide>"""
-
-    resp = client.messages.create(model=MODEL, max_tokens=3000, system=system, tools=[WRITE_TOOL],
+    resp = client.messages.create(model=MODEL, max_tokens=3000, system=SYSTEM_WRITER, tools=[WRITE_TOOL],
                                   tool_choice={"type": "tool", "name": "write_posts"},
                                   messages=[{"role": "user", "content": content}])
     posts = dict(next(b.input for b in resp.content if b.type == "tool_use"))
     posts["instagram"] = posts["instagram"][:INSTAGRAM_MAX_CHARS]
     posts.setdefault("note_for_owner", "")
     return posts
+
+
+# ---------------------------------------------------------------------------
+# Claude: autopilot planning (with optional web search for trends)
+# ---------------------------------------------------------------------------
+
+PLAN_TOOL = {
+    "name": "plan_post",
+    "description": "Submit the finished plan for one social media post.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "content_type": {"type": "string", "enum": list(CONTENT_TYPES)},
+            "topic": {"type": "string", "description": "Short topic label, e.g. 'Signs of bathroom leaks'."},
+            "library_item_id": {"type": "string", "description": "Only for 'showcase': the id of the library project to use."},
+            "cover_title": {"type": "string", "description": "Carousel cover headline, max ~60 characters, hooks in 1 second."},
+            "kicker": {"type": "string", "description": "2–3 word label above the title, e.g. 'Renovation tips', 'FAQ', 'Trend watch'."},
+            "slides": {
+                "type": "array", "minItems": 3, "maxItems": 6,
+                "description": "Carousel content slides (not needed for 'showcase').",
+                "items": {"type": "object", "properties": {
+                    "headline": {"type": "string", "description": "Max ~50 characters."},
+                    "body": {"type": "string", "description": "1–3 short sentences, max ~220 characters."}},
+                    "required": ["headline", "body"]},
+            },
+            "cta_title": {"type": "string", "description": "Closing slide headline, e.g. 'Planning a bathroom renovation?'"},
+            "cta_text": {"type": "string", "description": "One sentence inviting them to message Renovate Builders."},
+            "instagram": {"type": "string", "description": f"Instagram caption with 8–15 hashtags at the end. Max {INSTAGRAM_MAX_CHARS} characters."},
+            "facebook": {"type": "string", "description": "Facebook post, conversational, 0–3 hashtags."},
+            "alt_text": {"type": "string", "description": "One sentence describing the first image."},
+            "note_for_owner": {"type": "string", "description": "Why you chose this topic, and any source you used for a trend (short)."},
+        },
+        "required": ["content_type", "topic", "instagram", "facebook", "alt_text", "note_for_owner"],
+    },
+}
+
+
+def plan_with_claude(settings: dict) -> dict:
+    allowed = [t for t in settings["content_types"] if t in CONTENT_TYPES] or ["educational"]
+    lib = [it for it in library_items()][:40]
+    if not lib and "showcase" in allowed:
+        allowed = [t for t in allowed if t != "showcase"] or ["educational"]
+    recent = sorted(all_drafts(), key=lambda x: x["created"], reverse=True)[:15]
+    recent_txt = "\n".join(f"- {d['created'][:10]} [{d.get('content_type', 'project')}] "
+                           f"{d.get('topic') or d.get('notes', '')[:90]}" for d in recent) or "(none yet)"
+    lib_txt = "\n".join(f"- id={it['id']} used={it.get('used', 0)}x last_used={it.get('last_used') or 'never'}: "
+                        f"{it.get('notes') or '(no notes)'}" for it in lib) or "(empty)"
+    n = now()
+    request = f"""Plan ONE new post for Renovate Builders' Instagram and Facebook.
+
+Today: {n.strftime('%A %d %B %Y')}  ·  Location / market: {settings.get('location') or 'see brand guide'}
+Allowed content types (pick the one that best fits right now, and vary it against recent posts):
+{chr(10).join(f'- {t}: {CONTENT_TYPES[t]}' for t in allowed)}
+
+Recent posts (do NOT repeat these topics or angles):
+{recent_txt}
+
+Photo library (for 'showcase' only; prefer projects used least):
+{lib_txt}
+
+Rules:
+- English only. Practical, specific, genuinely useful to homeowners. No clickbait, no invented statistics.
+- For carousels: a cover title that hooks, 3–6 slides with one clear point each, then a closing call to action.
+- For 'trend': {'use web search (1–3 searches) to find a current renovation or interior trend, and mention the source in note_for_owner.' if settings.get('use_web_search') else 'web search is off; pick a well-established trend instead.'}
+- For 'showcase': choose a library_item_id and write captions about that project using its notes only.
+- Finish by calling plan_post exactly once."""
+
+    tools = [PLAN_TOOL]
+    if settings.get("use_web_search") and "trend" in allowed:
+        tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}, PLAN_TOOL]
+    messages = [{"role": "user", "content": request}]
+
+    for attempt in range(6):
+        try:
+            resp = client.messages.create(model=MODEL, max_tokens=4000, system=SYSTEM_WRITER,
+                                          tools=tools, messages=messages,
+                                          **({"tool_choice": {"type": "tool", "name": "plan_post"}} if attempt >= 3 else {}))
+        except anthropic.BadRequestError as e:
+            if len(tools) > 1 and "web search" in str(e).lower():   # web search disabled in the Console
+                tools = [PLAN_TOOL]
+                continue
+            raise
+        plan = next((b.input for b in resp.content if b.type == "tool_use" and b.name == "plan_post"), None)
+        if plan:
+            return dict(plan)
+        messages.append({"role": "assistant", "content": resp.content})
+        if resp.stop_reason == "pause_turn":          # long web search: let Claude continue
+            continue
+        messages.append({"role": "user", "content": "Now call plan_post with the finished plan."})
+    raise RuntimeError("Jackson couldn't finish planning the post.")
+
+
+def handle_for_slides() -> str:
+    m = load_meta() or {}
+    return f"@{m['ig_username']}" if m.get("ig_username") else "Renovate Builders"
+
+
+def build_auto_draft(settings: dict, slot: datetime | None) -> dict:
+    """Plan + build one autopilot draft. Returns the saved draft."""
+    plan = plan_with_claude(settings)
+    ctype = plan.get("content_type", "educational")
+    lib_ids = {it["id"]: it for it in library_items()}
+    item = lib_ids.get(plan.get("library_item_id") or "")
+
+    if ctype == "showcase" and item:
+        photos = item_photos(item["id"])[:MAX_PHOTOS]
+        item["used"] = item.get("used", 0) + 1
+        item["last_used"] = now().isoformat(timespec="minutes")
+        save_item(item)
+    else:
+        if ctype == "showcase":                       # no valid project chosen → fall back to tips
+            ctype = "educational"
+        cover_photo = None
+        if lib_ids:                                   # use the least-used library photo as cover background
+            pick = sorted(lib_ids.values(), key=lambda x: (x.get("cover_used", 0), x["created"]))[0]
+            pics = item_photos(pick["id"])
+            if pics:
+                cover_photo = pics[0]
+                pick["cover_used"] = pick.get("cover_used", 0) + 1
+                save_item(pick)
+        photos = slides.render_carousel(
+            plan.get("cover_title") or plan["topic"], plan.get("kicker") or "Renovation tips",
+            plan.get("slides") or [], plan.get("cta_title", ""), plan.get("cta_text", ""),
+            handle_for_slides(), settings.get("brand_color", "#c2410c"), cover_photo)
+
+    notes = f"Autopilot · {ctype}: {plan['topic']}"
+    if item and ctype == "showcase":
+        notes += f"\nProject notes: {item.get('notes', '')}"
+    d = new_draft(photos, notes, origin="autopilot", content_type=ctype, topic=plan["topic"],
+                  platforms=[p for p in settings["platforms"] if p in PLATFORMS] or list(PLATFORMS))
+    d["posts"] = {"instagram": plan["instagram"][:INSTAGRAM_MAX_CHARS], "facebook": plan["facebook"],
+                  "alt_text": plan.get("alt_text", ""), "note_for_owner": plan.get("note_for_owner", "")}
+    slot_s = slot.strftime("%Y-%m-%dT%H:%M") if slot else None
+    d["slot"] = slot_s
+    if settings["mode"] == "auto" and slot:
+        d["status"], d["schedule_at"] = "scheduled", slot_s
+    else:
+        d["status"], d["schedule_at"] = "awaiting_approval", slot_s
+    save_draft(d)
+    return d
+
+
+def notify(subject: str, body: str):
+    to = load_settings().get("notify_email")
+    if not (to and SMTP_HOST and SMTP_USER and SMTP_PASSWORD):
+        return
+    try:
+        msg = EmailMessage()
+        msg["Subject"], msg["From"], msg["To"] = subject, SMTP_USER, to
+        msg.set_content(body)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.send_message(msg)
+    except Exception:
+        traceback.print_exc()
+
+
+def parse_times(times: list[str]) -> list[tuple[int, int]]:
+    out = set()
+    for t in times or []:
+        try:
+            hh, mm = (int(x) for x in str(t).split(":")[:2])
+            if 0 <= hh < 24 and 0 <= mm < 60:
+                out.add((hh, mm))
+        except ValueError:
+            pass
+    return sorted(out)
+
+
+def upcoming_slots(s: dict, horizon_hours: int = 24 * 8) -> list[datetime]:
+    n = now()
+    out = []
+    for day in range(0, horizon_hours // 24 + 2):
+        for hh, mm in parse_times(s.get("times")) or [(18, 0)]:
+            dt = (n + timedelta(days=day)).replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if dt > n and dt.weekday() in s["days"] and dt <= n + timedelta(hours=horizon_hours):
+                out.append(dt)
+    return sorted(out)
+
+
+def describe_slot(slot: str | None) -> str:
+    return parse_local(slot).strftime("%A %d %b, %H:%M") if slot else "as soon as you approve"
+
+
+def run_autopilot_once(slot: datetime | None) -> dict:
+    """Prepare one post (for a slot, or right now when slot is None) and notify the owner."""
+    with autopilot_lock:
+        s = load_settings()
+        try:
+            d = build_auto_draft(s, slot)
+            s = load_settings()
+            s["last_run"], s["last_error"] = now().isoformat(timespec="minutes"), None
+            save_settings(s)
+        except Exception as e:
+            traceback.print_exc()
+            s = load_settings()
+            s["last_error"] = f"{now().strftime('%d %b %H:%M')}: {e}"
+            save_settings(s)
+            notify("Jackson couldn't prepare a post", f"Jackson hit a problem while preparing a post:\n\n{e}")
+            raise
+    link = f"{PUBLIC_URL}/?draft={d['id']}" if PUBLIC_URL else ""
+    if d["status"] == "awaiting_approval":
+        notify(f"Jackson prepared a post: {d['topic']}",
+               f"Jackson prepared a new post ({d['content_type']}): {d['topic']}\n\n"
+               f"Planned for: {describe_slot(d.get('schedule_at'))}\n\n"
+               f"Review and approve it here:\n{link}\n\nInstagram caption:\n{d['posts']['instagram']}")
+    else:
+        notify(f"Jackson scheduled a post: {d['topic']}",
+               f"Autopilot scheduled this post for {describe_slot(d.get('schedule_at'))}.\n"
+               f"Check or cancel it here:\n{link}\n\nInstagram caption:\n{d['posts']['instagram']}")
+    return d
+
+
+def autopilot_tick():
+    s = load_settings()
+    if not s["enabled"]:
+        return
+    n = now()
+    for slot in upcoming_slots(s, PREPARE_HOURS_AHEAD):
+        key = slot.strftime("%Y-%m-%dT%H:%M")
+        if key in s["prepared_slots"]:
+            continue
+        s["prepared_slots"] = (s["prepared_slots"] + [key])[-60:]   # mark first: never prepare a slot twice
+        save_settings(s)
+        try:
+            run_autopilot_once(slot)
+        except Exception:
+            pass
+        s = load_settings()
 
 
 # ---------------------------------------------------------------------------
@@ -225,18 +581,15 @@ def meta_status() -> dict:
 
 
 def token_info(token: str) -> dict:
-    """Ask Meta whether the token is valid and when it expires (0 = never)."""
     try:
-        info = graph("GET", "debug_token", token, input_token=token).get("data", {})
+        return graph("GET", "debug_token", token, input_token=token).get("data", {})
     except MetaError:
         return {}
-    return info
 
 
 def maybe_extend(token: str) -> str:
     """Turn a short (1–2 hour) test token into a 60-day one, if the app id/secret are configured."""
-    info = token_info(token)
-    exp = info.get("expires_at", 0)
+    exp = token_info(token).get("expires_at", 0)
     if META_APP_ID and META_APP_SECRET and exp and exp - time.time() < 7 * 86400:
         try:
             r = httpx.get(f"{GRAPH}/oauth/access_token", timeout=30, params={
@@ -258,6 +611,18 @@ def list_pages(token: str) -> list[dict]:
 # Publishing
 # ---------------------------------------------------------------------------
 
+def wait_ready(container_id: str, token: str, timeout: int = 120):
+    start = time.time()
+    while time.time() - start < timeout:
+        status = graph("GET", container_id, token, fields="status_code").get("status_code")
+        if status in ("FINISHED", "PUBLISHED"):
+            return
+        if status in ("ERROR", "EXPIRED"):
+            raise MetaError(f"Instagram couldn't process the image ({status}). Try a different photo.")
+        time.sleep(3)
+    raise MetaError("Instagram took too long to process the images. Try again in a few minutes.")
+
+
 def publish_instagram(m: dict, urls: list[str], caption: str, alt: str) -> str:
     ig, tok = m["ig_user_id"], m["user_token"]
     if len(urls) == 1:
@@ -274,18 +639,6 @@ def publish_instagram(m: dict, urls: list[str], caption: str, alt: str) -> str:
         return graph("GET", media_id, tok, fields="permalink").get("permalink", "")
     except MetaError:
         return ""
-
-
-def wait_ready(container_id: str, token: str, timeout: int = 120):
-    start = time.time()
-    while time.time() - start < timeout:
-        status = graph("GET", container_id, token, fields="status_code").get("status_code")
-        if status in ("FINISHED", "PUBLISHED"):
-            return
-        if status in ("ERROR", "EXPIRED"):
-            raise MetaError(f"Instagram couldn't process the photo ({status}). Try a different photo.")
-        time.sleep(3)
-    raise MetaError("Instagram took too long to process the photos. Try again in a few minutes.")
 
 
 def publish_facebook(m: dict, urls: list[str], message: str) -> str:
@@ -309,7 +662,7 @@ def run_publish(draft_id: str):
         if not m:
             d["errors"]["setup"] = "Instagram/Facebook aren't connected yet. Open the Connect page."
         elif not PUBLIC_URL:
-            d["errors"]["setup"] = "PUBLIC_URL isn't set on the server, so Meta can't download the photos."
+            d["errors"]["setup"] = "PUBLIC_URL isn't set on the server, so Meta can't download the images."
         else:
             urls = public_photo_urls(d)
             for p in d["platforms"]:
@@ -333,10 +686,11 @@ def run_publish(draft_id: str):
         if done:
             d["published_at"] = now().isoformat(timespec="minutes")
         save_draft(d)
-        return d
-
-
-claim_lock = threading.Lock()
+    if not done and d.get("origin") == "autopilot":
+        notify("Jackson couldn't publish a post",
+               f"Publishing '{d.get('topic')}' failed:\n{json.dumps(d['errors'], indent=1)}\n\n"
+               f"Open it here to retry:\n{PUBLIC_URL}/?draft={d['id']}")
+    return d
 
 
 def claim(draft_id: str, allowed: tuple[str, ...]) -> bool:
@@ -351,39 +705,38 @@ def claim(draft_id: str, allowed: tuple[str, ...]) -> bool:
 
 
 def publish_due_posts():
-    for f in (DATA / "drafts").glob("*/draft.json"):
-        try:
-            d = json.loads(f.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if d.get("status") == "scheduled" and datetime.fromisoformat(d["schedule_at"]).replace(tzinfo=TZ) <= now():
+    for d in all_drafts():
+        if d.get("status") == "scheduled" and d.get("schedule_at") and parse_local(d["schedule_at"]) <= now():
             if claim(d["id"], ("scheduled",)):
                 run_publish(d["id"])
 
 
 def scheduler_loop():
-    """Every 30 seconds, publish scheduled posts whose time has come."""
+    """Every 30 seconds: publish posts that are due, and let the autopilot prepare upcoming ones."""
     while True:
-        try:
-            publish_due_posts()
-        except Exception:
-            traceback.print_exc()
+        for job in (publish_due_posts, autopilot_tick):
+            try:
+                job()
+            except Exception:
+                traceback.print_exc()
         time.sleep(30)
 
 
 @asynccontextmanager
 async def lifespan(_app):
     (DATA / "drafts").mkdir(exist_ok=True)
-    # anything stuck mid-publish when the server restarted goes back to "scheduled"
-    for f in (DATA / "drafts").glob("*/draft.json"):
-        d = json.loads(f.read_text(encoding="utf-8"))
+    LIBRARY.mkdir(exist_ok=True)
+    for d in all_drafts():               # anything stuck mid-publish after a restart goes back to "scheduled"
         if d.get("status") == "publishing":
-            d["status"] = "scheduled"; save_draft(d)
+            d["status"] = "scheduled"
+            d["schedule_at"] = d.get("schedule_at") or now().strftime("%Y-%m-%dT%H:%M")
+            save_draft(d)
     threading.Thread(target=scheduler_loop, daemon=True).start()
     yield
 
 
 app = FastAPI(title="Jackson posting agent", lifespan=lifespan)
+EDITABLE = ("draft", "error", "awaiting_approval")
 
 
 # ---------------------------------------------------------------------------
@@ -391,25 +744,20 @@ app = FastAPI(title="Jackson posting agent", lifespan=lifespan)
 # ---------------------------------------------------------------------------
 
 @app.post("/api/drafts", dependencies=[Depends(require_login)])
-async def create_draft(photos: list[UploadFile] = File(...), notes: str = Form(""), language: str = Form("en")):
+async def create_draft(photos: list[UploadFile] = File(...), notes: str = Form("")):
     if not photos:
         raise HTTPException(400, "Add at least one photo.")
     if len(photos) > MAX_PHOTOS:
         raise HTTPException(400, f"Up to {MAX_PHOTOS} photos per post.")
-    draft_id = uuid.uuid4().hex[:12]
-    d_path = DATA / "drafts" / draft_id
-    d_path.mkdir(parents=True)
     try:
-        for i, f in enumerate(photos, 1):
-            (d_path / f"photo_{i:02d}.jpg").write_bytes(prepare_photo(await f.read()))
+        jpgs = [prepare_photo(await f.read()) for f in photos]
     except Exception:
         raise HTTPException(400, "One of the files isn't a photo Jackson can read (use JPG, PNG or HEIC).")
-    d = {"id": draft_id, "media_key": secrets.token_urlsafe(16), "created": now().isoformat(timespec="minutes"),
-         "notes": notes.strip()[:3000], "language": language if language in LANGUAGES else "en",
-         "status": "draft", "photo_count": len(photos), "platforms": list(PLATFORMS)}
+    d = new_draft(jpgs, notes)
     try:
         d["posts"] = write_posts(d)
     except anthropic.APIError as e:
+        shutil.rmtree(DATA / "drafts" / d["id"], ignore_errors=True)
         raise HTTPException(502, f"Jackson couldn't write the post right now ({e.__class__.__name__}). Try again.")
     save_draft(d)
     return d
@@ -422,12 +770,13 @@ class RegenerateIn(BaseModel):
 @app.post("/api/drafts/{draft_id}/regenerate", dependencies=[Depends(require_login)])
 def regenerate(draft_id: str, body: RegenerateIn):
     d = load_draft(draft_id)
-    if d["status"] not in ("draft", "error"):
-        raise HTTPException(409, "This post was already sent.")
+    if d["status"] not in EDITABLE:
+        raise HTTPException(409, "This post was already sent or scheduled.")
     try:
-        d["posts"] = write_posts(d, body.feedback.strip()[:1000] or "Write a fresh alternative version.")
+        new = write_posts(d, body.feedback.strip()[:1000] or "Write a fresh alternative version.")
     except anthropic.APIError as e:
         raise HTTPException(502, f"Jackson couldn't rewrite the post right now ({e.__class__.__name__}).")
+    d["posts"] = new
     save_draft(d)
     return d
 
@@ -442,8 +791,8 @@ class PublishIn(BaseModel):
 @app.post("/api/drafts/{draft_id}/publish", dependencies=[Depends(require_login)])
 def publish(draft_id: str, body: PublishIn):
     d = load_draft(draft_id)
-    if d["status"] in ("published", "publishing"):
-        raise HTTPException(409, "This post was already sent.")
+    if d["status"] not in EDITABLE:
+        raise HTTPException(409, "This post was already sent or scheduled.")
     platforms = [p for p in body.platforms if p in PLATFORMS]
     if not platforms:
         raise HTTPException(400, "Choose at least one platform.")
@@ -454,14 +803,13 @@ def publish(draft_id: str, body: PublishIn):
     d["posts"].update(instagram=body.instagram[:INSTAGRAM_MAX_CHARS], facebook=body.facebook)
     d["platforms"] = platforms
     if body.schedule_at:
-        when = datetime.fromisoformat(body.schedule_at).replace(tzinfo=TZ)
-        if when <= now():
+        if parse_local(body.schedule_at) <= now():
             raise HTTPException(400, "The scheduled time is in the past.")
-        d["status"], d["schedule_at"] = "scheduled", when.strftime("%Y-%m-%dT%H:%M")
+        d["status"], d["schedule_at"] = "scheduled", parse_local(body.schedule_at).strftime("%Y-%m-%dT%H:%M")
         save_draft(d)
         return d
     save_draft(d)
-    if not claim(draft_id, ("draft", "error")):
+    if not claim(draft_id, EDITABLE):
         raise HTTPException(409, "This post is already being sent.")
     return run_publish(draft_id)
 
@@ -471,9 +819,19 @@ def unschedule(draft_id: str):
     d = load_draft(draft_id)
     if d["status"] != "scheduled":
         raise HTTPException(409, "This post isn't scheduled.")
-    d["status"], d["schedule_at"] = "draft", None
+    d["status"] = "awaiting_approval" if d.get("origin") == "autopilot" else "draft"
+    d["schedule_at"] = None
     save_draft(d)
     return d
+
+
+@app.delete("/api/drafts/{draft_id}", dependencies=[Depends(require_login)])
+def delete_draft(draft_id: str):
+    d = load_draft(draft_id)
+    if d["status"] not in EDITABLE + ("scheduled",):
+        raise HTTPException(409, "Published posts can't be deleted here.")
+    shutil.rmtree(draft_dir(draft_id), ignore_errors=True)
+    return {"deleted": True}
 
 
 @app.get("/api/drafts/{draft_id}", dependencies=[Depends(require_login)])
@@ -483,12 +841,116 @@ def get_draft(draft_id: str):
 
 @app.get("/api/history", dependencies=[Depends(require_login)])
 def history():
-    items = []
-    for f in (DATA / "drafts").glob("*/draft.json"):
-        d = json.loads(f.read_text(encoding="utf-8"))
-        items.append({k: d.get(k) for k in ("id", "created", "status", "notes", "platforms", "schedule_at", "published_at")}
-                     | {"preview": (d.get("posts") or {}).get("instagram", "")[:140]})
-    return sorted(items, key=lambda x: x["created"], reverse=True)[:50]
+    items = [{k: d.get(k) for k in ("id", "created", "status", "notes", "platforms", "schedule_at",
+                                     "published_at", "origin", "topic", "content_type")}
+             | {"preview": (d.get("posts") or {}).get("instagram", "")[:140]} for d in all_drafts()]
+    return sorted(items, key=lambda x: x["created"], reverse=True)[:60]
+
+
+# ---------------------------------------------------------------------------
+# API: photo library
+# ---------------------------------------------------------------------------
+
+@app.get("/api/library", dependencies=[Depends(require_login)])
+def get_library():
+    return library_items()
+
+
+@app.post("/api/library", dependencies=[Depends(require_login)])
+async def add_library(photos: list[UploadFile] = File(...), notes: str = Form("")):
+    if not photos or len(photos) > MAX_PHOTOS:
+        raise HTTPException(400, f"Add 1–{MAX_PHOTOS} photos of one project.")
+    try:
+        jpgs = [prepare_photo(await f.read()) for f in photos]
+    except Exception:
+        raise HTTPException(400, "One of the files isn't a photo Jackson can read (use JPG, PNG or HEIC).")
+    item_id = uuid.uuid4().hex[:12]
+    (LIBRARY / item_id).mkdir(parents=True)
+    for i, j in enumerate(jpgs, 1):
+        (LIBRARY / item_id / f"photo_{i:02d}.jpg").write_bytes(j)
+    it = {"id": item_id, "created": now().isoformat(timespec="minutes"), "notes": notes.strip()[:1500],
+          "photo_count": len(jpgs), "used": 0, "last_used": None}
+    save_item(it)
+    return it
+
+
+@app.delete("/api/library/{item_id}", dependencies=[Depends(require_login)])
+def delete_library(item_id: str):
+    shutil.rmtree(LIBRARY / safe_id(item_id), ignore_errors=True)
+    return {"deleted": True}
+
+
+@app.get("/library/{item_id}/{n}", dependencies=[Depends(require_login)])
+def library_photo(item_id: str, n: int):
+    p = LIBRARY / safe_id(item_id) / f"photo_{n:02d}.jpg"
+    if not p.exists():
+        raise HTTPException(404)
+    return FileResponse(p, media_type="image/jpeg")
+
+
+# ---------------------------------------------------------------------------
+# API: autopilot
+# ---------------------------------------------------------------------------
+
+class SettingsIn(BaseModel):
+    enabled: bool
+    days: list[int]
+    times: list[str]
+    mode: str
+    platforms: list[str]
+    content_types: list[str]
+    use_web_search: bool
+    location: str = ""
+    timezone: str
+    brand_color: str = "#c2410c"
+    notify_email: str = ""
+
+
+def autopilot_status() -> dict:
+    s = load_settings()
+    return {**{k: v for k, v in s.items() if k != "prepared_slots"},
+            "next_slots": [describe_slot(x.strftime("%Y-%m-%dT%H:%M")) for x in upcoming_slots(s)][:6]
+            if s["enabled"] else [],
+            "email_ready": bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD),
+            "library_count": len(library_items()),
+            "content_type_labels": CONTENT_TYPES}
+
+
+@app.get("/api/autopilot", dependencies=[Depends(require_login)])
+def get_autopilot():
+    return autopilot_status()
+
+
+@app.post("/api/autopilot", dependencies=[Depends(require_login)])
+def set_autopilot(body: SettingsIn):
+    if body.timezone not in available_timezones():
+        raise HTTPException(400, "Unknown time zone.")
+    times = parse_times(body.times)[:4]
+    if not times:
+        raise HTTPException(400, "Add at least one time, like 18:00.")
+    days = sorted({d for d in body.days if 0 <= d <= 6})
+    if body.enabled and not days:
+        raise HTTPException(400, "Pick at least one day.")
+    s = load_settings()
+    s.update(enabled=body.enabled, days=days, times=[f"{h:02d}:{m:02d}" for h, m in times],
+             mode="auto" if body.mode == "auto" else "approve",
+             platforms=[p for p in body.platforms if p in PLATFORMS] or list(PLATFORMS),
+             content_types=[c for c in body.content_types if c in CONTENT_TYPES] or ["educational"],
+             use_web_search=body.use_web_search, location=body.location.strip()[:120],
+             timezone=body.timezone, brand_color=body.brand_color if body.brand_color.startswith("#") else "#c2410c",
+             notify_email=body.notify_email.strip()[:200])
+    save_settings(s)
+    return autopilot_status()
+
+
+@app.post("/api/autopilot/run-now", dependencies=[Depends(require_login)])
+def autopilot_run_now():
+    if autopilot_lock.locked():
+        raise HTTPException(409, "Jackson is already preparing a post. Give him a minute.")
+    try:
+        return run_autopilot_once(None)
+    except Exception as e:
+        raise HTTPException(502, f"Jackson couldn't prepare a post: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +1002,7 @@ def disconnect_meta():
 
 @app.get("/media/{draft_id}/{key}/{n}.jpg")
 def public_media(draft_id: str, key: str, n: int):
-    """Photos Meta downloads when publishing. Unguessable link, no login needed."""
+    """Images Meta downloads when publishing. Unguessable link, no login needed."""
     d = load_draft(draft_id)
     if not secrets.compare_digest(key, d["media_key"]):
         raise HTTPException(404)
@@ -560,8 +1022,10 @@ def photo(draft_id: str, n: int):
 
 @app.get("/health")
 def health():
+    s = load_settings()
     return {"ok": True, "agent": "Jackson", "model": MODEL, "public_url": PUBLIC_URL or None,
-            "meta_connected": META_FILE.exists(), "data_dir": str(DATA)}
+            "meta_connected": META_FILE.exists(), "data_dir": str(DATA),
+            "autopilot": "on" if s["enabled"] else "off"}
 
 
 @app.get("/static/style.css")
@@ -572,6 +1036,11 @@ def stylesheet():
 @app.get("/connect", dependencies=[Depends(require_login)])
 def connect_page():
     return FileResponse(BASE / "connect.html")
+
+
+@app.get("/autopilot", dependencies=[Depends(require_login)])
+def autopilot_page():
+    return FileResponse(BASE / "autopilot.html")
 
 
 @app.get("/", dependencies=[Depends(require_login)])

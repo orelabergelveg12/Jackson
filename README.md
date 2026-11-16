@@ -1,25 +1,30 @@
 # Jackson — Renovate Builders' posting agent
 
-Jackson turns job photos into posts and publishes them **himself** to **Instagram and Facebook**
-through Meta's official API. There's no posting service to pay for.
+Jackson writes posts in English and publishes them **himself** to **Instagram and Facebook**
+through Meta's official API.
 
-1. On your phone, open Jackson, add job photos and a few words of notes.
-2. Jackson looks at the photos and writes the Instagram caption and the Facebook post
-   (English, Hebrew or both).
-3. Edit anything, or tell him "shorter" / "mention the storage" and he rewrites it.
-4. Tap **Approve & publish**, or schedule it. Nothing posts without your approval.
+**Manual posts:** add job photos and a note → Jackson writes the posts → you approve or schedule.
+
+**Autopilot:** on the days and time you choose, Jackson plans a post on his own:
+educational tips, seasonal advice, customer FAQs, current trends (found with web search) or a
+project from your photo library. He designs carousel slides in your brand color, then either
+waits for your approval or posts automatically.
 
 ```
 jackson-poster/
-├── brand.md          ← EDIT: services, area, voice, hashtags
-├── app.py            ← the agent
+├── brand.md               ← EDIT: services, area, voice, hashtags
+├── app.py                 ← the agent
+├── slides.py              ← draws the carousel slides
 ├── requirements.txt
-├── index.html        ← the posts page
-├── connect.html      ← the connect page
-└── style.css
+├── index.html             ← Posts page
+├── autopilot.html         ← Autopilot page
+├── connect.html           ← Connect page
+├── style.css
+└── Heebo_*.ttf, Heebo-OFL.txt   ← font for the slides (free, open license)
 ```
 
-**Monthly cost: about $10.** Render server $7, Render disk $0.25, Claude about 5¢ per post.
+**Monthly cost: about $10–12.** Render server $7, Render disk $0.25, Claude about 5¢ per manual post and
+5–10¢ per autopilot post (a few cents more when it searches the web).
 
 ---
 
@@ -134,6 +139,53 @@ Open `brand.md` and replace every `[FILL IN]`: services, cities, website, phone,
    Jackson now opens like an app.
 
 You're done.
+
+---
+
+# Autopilot
+
+Open Jackson → **Autopilot** (top right).
+
+1. **Turn it on** with the switch.
+2. **Days and times:** e.g. Mon / Wed / Fri at 18:00, plus your **time zone**. Use **+ Add a time**
+   for more than one post a day (up to 4), e.g. every day at 10:00 and 18:00 for a launch week.
+   Jackson prepares each post about a day before its time.
+3. **How much freedom:**
+   - **Ask me first** (recommended): the post appears at the top of the Posts page under
+     *Waiting for your approval*. Approve it to post at the planned time, edit it, or **Skip** it.
+   - **Post automatically:** Jackson schedules and publishes on his own. You can still open,
+     edit or cancel any scheduled post before it goes out.
+4. **What to post:** tick the types you want (Educational, Seasonal, FAQ, Trend, Showcase).
+5. **Your area:** your city or region, so seasonal tips and trends fit your market.
+6. **Slide color:** your brand color for the carousel slides.
+7. **Save settings.**
+
+Tap **✨ Prepare a post now (test)** to see what Jackson makes, without waiting for a scheduled day.
+
+**Photo library:** on the Autopilot page, add photos of finished projects (one project at a time,
+with a short note). Jackson uses them for *Showcase* posts and as cover backgrounds for tip slides.
+Add 5–10 projects to start.
+
+## Email notifications (optional)
+
+Without email, check the Posts page; drafts waiting for you are always at the top.
+To get an email whenever a post is ready (or something fails), add these in
+**Render → Environment** (example for Gmail):
+
+| Key | Value |
+|---|---|
+| `SMTP_HOST` | `smtp.gmail.com` |
+| `SMTP_PORT` | `587` |
+| `SMTP_USER` | the Gmail address Jackson sends from |
+| `SMTP_PASSWORD` | a Gmail **App Password** (Google Account → Security → 2-Step Verification → App passwords) |
+
+Then type your address in **Autopilot → Notifications** and save.
+
+## Updating Jackson on GitHub
+
+Upload the new files with **Add file → Upload files** (same names are replaced) → **Commit changes**.
+Render redeploys in ~2 minutes. **Don't re-upload `brand.md`** if you already filled yours in.
+Your Meta connection, posts, library and settings are kept on the Render disk.
 
 ---
 

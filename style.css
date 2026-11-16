@@ -67,3 +67,28 @@ ol.steps{padding-left:20px;margin:8px 0} ol.steps li{margin-bottom:6px}
 code{background:var(--bg);border:1px solid var(--line);padding:1px 6px;border-radius:6px;font-size:14px}
 .pages label:not(.lbl){display:flex;gap:10px;align-items:center;padding:10px;border:1px solid var(--line);border-radius:10px;margin-top:8px;cursor:pointer}
 [dir=auto]{unicode-bidi:plaintext}
+
+/* --- autopilot additions --- */
+.hnav{margin-left:auto;display:flex;gap:6px}
+.hnav .hlink{margin-left:0}
+.pill{margin-left:auto;font-size:12px;font-weight:700;padding:4px 10px;border-radius:99px;background:var(--line);color:var(--muted);text-decoration:none;white-space:nowrap}
+.pill.on{background:var(--ok-soft);color:var(--ok)}
+.badge.awaiting_approval{background:var(--accent-soft);color:var(--accent)}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:99px;padding:7px 14px;cursor:pointer;font-weight:600;font-size:15px;user-select:none}
+.chip:has(input:checked){background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.chip input{accent-color:var(--accent);margin:0}
+.checkline{display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-top:1px solid var(--line);cursor:pointer}
+.checkline:first-child{border-top:0}
+.checkline input{width:20px;height:20px;margin-top:3px;accent-color:var(--accent);flex-shrink:0}
+input[type=time],input[type=color]{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px;width:100%}
+button.small{padding:6px 12px;font-size:14px;align-self:center}
+.switch{position:relative;width:56px;height:32px;flex-shrink:0}
+.switch input{opacity:0;width:0;height:0}
+.switch span{position:absolute;inset:0;background:var(--line);border-radius:99px;cursor:pointer;transition:.2s}
+.switch span::before{content:"";position:absolute;width:26px;height:26px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.25)}
+.switch input:checked + span{background:var(--accent)}
+.switch input:checked + span::before{transform:translateX(24px)}
+#thumbs2 img{cursor:zoom-in}
+@media (max-width:420px){ header small{display:none} .hnav .hlink{padding:6px 10px;font-size:13px} }
+.times .row{margin-bottom:8px}

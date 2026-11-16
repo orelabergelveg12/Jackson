@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#c2410c">
+<title>Jackson · Autopilot</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="logo">J</div>
+  <div><h1>Autopilot</h1><small>Jackson posts on his own</small></div>
+  <nav class="hnav"><a class="hlink" href="/">← Posts</a></nav>
+</header>
+<main>
+  <!-- Status -->
+  <section class="card">
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">Autopilot</h2>
+      <label class="switch"><input type="checkbox" id="enabled"><span></span></label>
+    </div>
+    <p class="muted" id="statusLine" style="margin:8px 0 0">Loading…</p>
+    <div id="errBox"></div>
+    <button class="wide" id="runNow">✨ Prepare a post now (test)</button>
+    <div id="runMsg"></div>
+  </section>
+
+  <!-- Schedule -->
+  <section class="card">
+    <h2>When to post</h2>
+    <label class="lbl">Days</label>
+    <div class="chips" id="days"></div>
+    <label class="lbl">Times each day</label>
+    <div id="times" class="times"></div>
+    <button class="small" id="addTime" type="button" style="margin-top:8px">+ Add a time</button>
+    <label class="lbl" for="timezone">Time zone</label><select id="timezone"></select>
+    <p class="muted">One post per time, on every ticked day. Jackson prepares each post about a day before its time.</p>
+
+    <label class="lbl">How much freedom</label>
+    <div class="seg" id="mode">
+      <button data-v="approve" class="on">Ask me first</button><button data-v="auto">Post automatically</button>
+    </div>
+    <p class="muted" id="modeHelp"></p>
+
+    <label class="lbl">Post to</label>
+    <div class="chips" id="platforms"></div>
+  </section>
+
+  <!-- Content -->
+  <section class="card">
+    <h2>What to post</h2>
+    <div id="types"></div>
+    <label class="checkline" style="margin-top:8px;border-top:2px solid var(--line)"><input type="checkbox" id="use_web_search"> <span><b>Search the web for current trends</b><br><span class="muted">About 1–3¢ per search, only for trend posts.</span></span></label>
+    <label class="lbl" for="location">Your area (for seasons, weather and local trends)</label>
+    <input type="text" id="location" placeholder="e.g. your city and region">
+    <label class="lbl" for="brand_color">Slide color</label>
+    <input type="color" id="brand_color" value="#c2410c" style="width:80px;height:44px;padding:4px">
+  </section>
+
+  <!-- Notifications -->
+  <section class="card">
+    <h2>Notifications</h2>
+    <label class="lbl" for="notify_email">Email me when a post is ready or something fails</label>
+    <input type="text" id="notify_email" placeholder="office@renovatebuilders.com">
+    <p class="muted" id="emailHelp"></p>
+  </section>
+
+  <button class="primary wide" id="saveBtn" style="margin-top:0">Save settings</button>
+  <div id="saveMsg" style="margin-bottom:16px"></div>
+
+  <!-- Library -->
+  <section class="card">
+    <h2>Photo library</h2>
+    <p class="muted" style="margin-top:0">Add photos of finished projects (one project at a time). Jackson uses them for project showcases and as cover backgrounds for tips.</p>
+    <label class="drop" for="libFiles"><b>📷 Add a project</b><span>Up to 10 photos of one job</span></label>
+    <input id="libFiles" type="file" accept="image/*" multiple class="hidden">
+    <div class="thumbs" id="libThumbs"></div>
+    <div id="libForm" class="hidden">
+      <label class="lbl" for="libNotes">About this project</label>
+      <textarea id="libNotes" placeholder="e.g. Kitchen remodel: white shaker cabinets, quartz counters, new island, 4 weeks."></textarea>
+      <button class="primary wide" id="libSave">Add to library</button>
+    </div>
+    <div id="libMsg"></div>
+    <div id="libList" style="margin-top:12px"></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+const ZONES = ["Asia/Jerusalem","America/Los_Angeles","America/Denver","America/Chicago","America/New_York","Europe/London","Australia/Perth","Australia/Sydney"];
+let S = null, mode = "approve", libFiles = [];
+
+async function api(url, opts={}){ const r = await fetch(url, opts); let d; try { d = await r.json(); } catch { d = {}; }
+  if (!r.ok) throw new Error(d.detail || `Something went wrong (${r.status})`); return d; }
+const post = (url, body) => api(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
+function show(id, text, kind, link){ $(id).innerHTML = ""; if (!text) return; const el = document.createElement("div"); el.className = "msg " + kind; el.textContent = text;
+  if (link) { el.append(" "); const a = document.createElement("a"); a.href = link.href; a.textContent = link.text; el.append(a); } $(id).append(el); }
+function chip(container, value, label, on){ const l = document.createElement("label"); l.className = "chip";
+  const i = document.createElement("input"); i.type = "checkbox"; i.value = value; i.checked = on; l.append(i, label); container.append(l); }
+function checked(sel){ return [...document.querySelectorAll(sel + " input:checked")].map(i => i.value); }
+function setMode(v){ mode = v; $("#mode").querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.v === v));
+  $("#modeHelp").textContent = v === "auto" ? "Jackson schedules and publishes posts himself. You can still open, edit or cancel them before they go out."
+    : "Jackson prepares each post and waits. It appears under 'Waiting for your approval' on the Posts page."; }
+$("#mode").addEventListener("click", e => { const b = e.target.closest("button"); if (b) setMode(b.dataset.v); });
+
+function addTimeRow(value){
+  const box = $("#times"); if (box.children.length >= 4) return;
+  const r = document.createElement("div"); r.className = "row";
+  const i = document.createElement("input"); i.type = "time"; i.value = typeof value === "string" ? value : "12:00"; i.style.flex = "1";
+  const x = document.createElement("button"); x.type = "button"; x.className = "small"; x.textContent = "Remove";
+  x.onclick = () => { if (box.children.length > 1) r.remove(); };
+  r.append(i, x); box.append(r);
+}
+$("#addTime").onclick = () => addTimeRow();
+
+function render(s){
+  S = s;
+  $("#enabled").checked = s.enabled;
+  $("#statusLine").textContent = s.enabled
+    ? (s.next_slots.length ? `On · next posts: ${s.next_slots.slice(0, 3).join(" · ")}` : "On · no upcoming days selected")
+    : "Off · Jackson only posts when you upload photos.";
+  if (s.last_run) $("#statusLine").textContent += ` · last prepared ${s.last_run.replace("T", " ")}`;
+  show("#errBox", s.last_error ? "Last problem: " + s.last_error : "", "err");
+  $("#days").innerHTML = ""; DAYS.forEach((d, i) => chip($("#days"), i, d, s.days.includes(i)));
+  $("#times").innerHTML = ""; (s.times && s.times.length ? s.times : ["18:00"]).forEach(addTimeRow);
+  const zones = ZONES.includes(s.timezone) ? ZONES : [s.timezone, ...ZONES];
+  $("#timezone").innerHTML = zones.map(z => `<option${z === s.timezone ? " selected" : ""}>${z}</option>`).join("");
+  setMode(s.mode);
+  $("#platforms").innerHTML = ""; [["instagram","Instagram"],["facebook","Facebook"]].forEach(([v, l]) => chip($("#platforms"), v, l, s.platforms.includes(v)));
+  $("#types").innerHTML = "";
+  Object.entries(s.content_type_labels).forEach(([k, label]) => { const l = document.createElement("label"); l.className = "checkline";
+    const i = document.createElement("input"); i.type = "checkbox"; i.value = k; i.checked = s.content_types.includes(k);
+    const t = document.createElement("span"); const b = document.createElement("b"); b.textContent = ({faq: "FAQ"})[k] || (k[0].toUpperCase() + k.slice(1));
+    t.append(b, document.createElement("br")); const m = document.createElement("span"); m.className = "muted";
+    m.textContent = label + (k === "showcase" && !s.library_count ? " (add projects to the library below first)" : ""); t.append(m);
+    l.append(i, t); $("#types").append(l); });
+  $("#use_web_search").checked = s.use_web_search;
+  $("#location").value = s.location || "";
+  $("#brand_color").value = s.brand_color || "#c2410c";
+  $("#notify_email").value = s.notify_email || "";
+  $("#emailHelp").textContent = s.email_ready ? "Email sending is set up ✔"
+    : "Email isn't set up on the server yet (see README, 'Email notifications'). Until then, check the Posts page; drafts waiting for you appear at the top.";
+}
+
+async function save(extra = {}){
+  const body = {enabled: $("#enabled").checked, days: checked("#days").map(Number), times: [...document.querySelectorAll("#times input")].map(i => i.value).filter(Boolean), mode,
+    platforms: checked("#platforms"), content_types: checked("#types"), use_web_search: $("#use_web_search").checked,
+    location: $("#location").value, timezone: $("#timezone").value, brand_color: $("#brand_color").value,
+    notify_email: $("#notify_email").value, ...extra};
+  return render(await post("/api/autopilot", body));
+}
+$("#saveBtn").onclick = async () => { try { await save(); show("#saveMsg", "Saved ✔", "ok"); } catch (e) { show("#saveMsg", e.message, "err"); } };
+$("#enabled").onchange = async () => { try { await save(); show("#saveMsg", $("#enabled").checked ? "Autopilot is on ✔" : "Autopilot is off.", "ok"); }
+  catch (e) { $("#enabled").checked = !$("#enabled").checked; show("#saveMsg", e.message, "err"); } };
+
+$("#runNow").onclick = async () => {
+  const btn = $("#runNow"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Jackson is planning a post… (about a minute)'; show("#runMsg");
+  try { const d = await post("/api/autopilot/run-now");
+    show("#runMsg", `Ready: "${d.topic}" (${d.content_type}).`, "ok", {href: `/?draft=${d.id}`, text: "Review it →"});
+  } catch (e) { show("#runMsg", e.message, "err"); }
+  btn.disabled = false; btn.textContent = "✨ Prepare a post now (test)";
+};
+
+// Library
+$("#libFiles").addEventListener("change", e => { libFiles = [...libFiles, ...e.target.files].slice(0, 10); e.target.value = "";
+  $("#libThumbs").innerHTML = ""; libFiles.forEach(f => { const i = new Image(); i.src = URL.createObjectURL(f); $("#libThumbs").append(i); });
+  $("#libForm").classList.toggle("hidden", !libFiles.length); });
+$("#libSave").onclick = async () => {
+  const btn = $("#libSave"); btn.disabled = true; btn.textContent = "Uploading…";
+  const fd = new FormData(); libFiles.forEach(f => fd.append("photos", f)); fd.append("notes", $("#libNotes").value);
+  try { await api("/api/library", {method: "POST", body: fd}); libFiles = []; $("#libThumbs").innerHTML = ""; $("#libNotes").value = "";
+    $("#libForm").classList.add("hidden"); show("#libMsg", "Added to the library ✔", "ok"); loadLib(); }
+  catch (e) { show("#libMsg", e.message, "err"); }
+  btn.disabled = false; btn.textContent = "Add to library";
+};
+async function loadLib(){
+  const items = await api("/api/library"); const box = $("#libList"); box.innerHTML = "";
+  if (!items.length) { box.innerHTML = '<span class="muted">No projects yet.</span>'; return; }
+  items.forEach(it => { const r = document.createElement("div"); r.className = "hist";
+    r.innerHTML = '<img alt=""><div style="min-width:0;flex:1"><span class="muted"></span><p></p></div><button class="small">Remove</button>';
+    r.querySelector("img").src = `/library/${it.id}/1`;
+    r.querySelector(".muted").textContent = `${it.photo_count} photos · used ${it.used || 0}×`;
+    r.querySelector("p").textContent = it.notes || "(no notes)";
+    r.querySelector("button").onclick = async ev => { ev.stopPropagation(); await api(`/api/library/${it.id}`, {method: "DELETE"}); loadLib(); };
+    box.append(r); });
+}
+
+api("/api/autopilot").then(render).catch(e => show("#errBox", e.message, "err"));
+loadLib();
+</script>
+</body>
+</html>
