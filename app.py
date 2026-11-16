@@ -85,7 +85,29 @@ CONTENT_TYPES = {
 
 BRAND = (BASE / "brand.md").read_text(encoding="utf-8")
 
-client = anthropic.Anthropic()
+# Keys that aren't tied to a workspace need the workspace id on every request.
+ANTHROPIC_WORKSPACE_ID = os.environ.get("ANTHROPIC_WORKSPACE_ID")
+client = anthropic.Anthropic(default_headers={"anthropic-workspace-id": ANTHROPIC_WORKSPACE_ID}
+                             if ANTHROPIC_WORKSPACE_ID else None)
+
+
+def claude_error(e: Exception) -> str:
+    """Readable reason from a Claude API error, with a hint for the common ones."""
+    msg = getattr(e, "message", None) or str(e)
+    body = getattr(e, "body", None)
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        msg = body["error"].get("message") or msg
+    low = msg.lower()
+    hint = ""
+    if "workspace" in low:
+        hint = (" Fix: create a new Claude key with Workspace = Default (console.anthropic.com → API Keys) "
+                "and replace ANTHROPIC_API_KEY in Render.")
+    elif "credit balance" in low:
+        hint = " Fix: add credit at console.anthropic.com → Billing."
+    elif "usage limit" in low or "spend limit" in low:
+        hint = " Fix: raise your monthly limit at console.anthropic.com → Limits."
+    print(f"[claude error] {e.__class__.__name__}: {msg}", flush=True)
+    return f"{e.__class__.__name__}: {msg.rstrip('. ')}.{hint}"
 security = HTTPBasic()
 publish_lock = threading.Lock()
 claim_lock = threading.Lock()
@@ -553,7 +575,7 @@ def run_autopilot_once(slot: datetime | None) -> dict:
         except Exception as e:
             traceback.print_exc()
             s = load_settings()
-            s["last_error"] = f"{now().strftime('%d %b %H:%M')}: {e}"
+            s["last_error"] = f"{now().strftime('%d %b %H:%M')}: " + (claude_error(e) if isinstance(e, anthropic.APIError) else str(e))
             save_settings(s)
             notify("Jackson couldn't prepare a post", f"Jackson hit a problem while preparing a post:\n\n{e}")
             raise
@@ -806,7 +828,7 @@ async def create_draft(photos: list[UploadFile] = File(...), notes: str = Form("
         d["posts"] = write_posts(d)
     except anthropic.APIError as e:
         shutil.rmtree(DATA / "drafts" / d["id"], ignore_errors=True)
-        raise HTTPException(502, f"Jackson couldn't write the post right now ({e.__class__.__name__}). Try again.")
+        raise HTTPException(502, f"Jackson couldn't write the post. {claude_error(e)}")
     save_draft(d)
     return d
 
@@ -823,7 +845,7 @@ def regenerate(draft_id: str, body: RegenerateIn):
     try:
         new = write_posts(d, body.feedback.strip()[:1000] or "Write a fresh alternative version.")
     except anthropic.APIError as e:
-        raise HTTPException(502, f"Jackson couldn't rewrite the post right now ({e.__class__.__name__}).")
+        raise HTTPException(502, f"Jackson couldn't rewrite the post. {claude_error(e)}")
     d["posts"] = new
     save_draft(d)
     return d
@@ -998,7 +1020,8 @@ def autopilot_run_now():
     try:
         return run_autopilot_once(None)
     except Exception as e:
-        raise HTTPException(502, f"Jackson couldn't prepare a post: {e}")
+        raise HTTPException(502, f"Jackson couldn't prepare a post. "
+                                 f"{claude_error(e) if isinstance(e, anthropic.APIError) else e}")
 
 
 # ---------------------------------------------------------------------------
